@@ -23,7 +23,7 @@ State persisted to StateStore so a mid-session restart reconciles:
 
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
-from typing import Callable, Optional
+from typing import Optional
 
 from brokers.base import BrokerAdapter, StopOrderRequest
 from brokers.paper.paper_broker import PaperBroker
@@ -97,7 +97,6 @@ class Orchestrator:
         no_new_trade_after: time = time(14, 30),
         pre_squareoff_buffer_minutes: int = 5,
         telegram=None,
-        position_sizer_fn: Optional[Callable[[str], int]] = None,
     ) -> None:
         self.mode = mode
         self.broker = broker
@@ -111,7 +110,6 @@ class Orchestrator:
         self.no_new_trade_after = no_new_trade_after
         self.pre_squareoff_buffer = timedelta(minutes=pre_squareoff_buffer_minutes)
         self.telegram = telegram
-        self.position_sizer_fn = position_sizer_fn
 
         self.rolling_bars: dict[str, _RollingBar] = {}
         self.oco_pairs: dict[str, _OcoPair] = {}
@@ -238,21 +236,13 @@ class Orchestrator:
         })
 
         meta = self.symbols[symbol]
-        if self.position_sizer_fn is not None:
-            sized_qty = max(int(self.position_sizer_fn(symbol)), 0)
-            if sized_qty == 0:
-                self.audit.emit("guardrail_blocked", symbol, {"reason": "SIZER_RETURNED_ZERO"})
-                return
-            quantity = sized_qty
-        else:
-            quantity = meta.lot_size
         long_intent = f"{symbol}-{now.date().isoformat()}-LONG-STOP"
         short_intent = f"{symbol}-{now.date().isoformat()}-SHORT-STOP"
         long_order = self.broker.place_stop_order(StopOrderRequest(
             symbol=symbol,
             security_id=meta.security_id,
             side="LONG",
-            quantity=quantity,
+            quantity=meta.lot_size,
             trigger_price=levels.long_entry,
             exchange_segment=meta.exchange_segment,
         ))
@@ -260,7 +250,7 @@ class Orchestrator:
             symbol=symbol,
             security_id=meta.security_id,
             side="SHORT",
-            quantity=quantity,
+            quantity=meta.lot_size,
             trigger_price=levels.short_entry,
             exchange_segment=meta.exchange_segment,
         ))

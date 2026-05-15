@@ -1,6 +1,6 @@
 import os
 from datetime import date, datetime
-from typing import Callable, Literal, Optional
+from typing import Literal, Optional
 
 from brokers.base import BrokerAdapter
 from core.logger import get_logger
@@ -48,7 +48,6 @@ class ExecutionEngine:
         guardrails: Optional[GuardRails] = None,
         state_store: Optional[StateStore] = None,
         mode: Optional[str] = None,
-        position_sizer_fn: Optional[Callable[[], int]] = None,
     ) -> None:
         self.mode: Mode = _resolve_mode(mode)
         if self.mode == "LIVE" and broker is None:
@@ -59,9 +58,6 @@ class ExecutionEngine:
         self.broker = broker
         self.guardrails = guardrails
         self.state_store = state_store or StateStore("execution_state.json")
-        # Phase 6: when set, on_bar uses this to compute quantity from
-        # capital + sl_dist rather than the caller-supplied default of 1.
-        self.position_sizer_fn = position_sizer_fn
 
         self.positions: dict[str, StrategyPosition] = {}
         self.closed_trades: list[StrategyTradeResult] = []
@@ -78,24 +74,9 @@ class ExecutionEngine:
         high: float,
         low: float,
         close: float,
-        quantity: Optional[int] = 1,
+        quantity: int = 1,
     ) -> Optional[StrategyTradeResult]:
-        """`quantity=None` defers to `self.position_sizer_fn`. The Phase 1
-        parity test passes quantity=1 explicitly so the existing contract
-        stays intact; callers that want capital-based sizing pass None.
-        """
         self._roll_day_if_needed(bar_time.date())
-
-        if quantity is None:
-            if self.position_sizer_fn is None:
-                return self._record_rejection_returning_none(
-                    symbol, bar_time, "NO_SIZER_AND_NO_QUANTITY"
-                )
-            quantity = max(int(self.position_sizer_fn()), 0)
-            if quantity == 0:
-                return self._record_rejection_returning_none(
-                    symbol, bar_time, "SIZER_RETURNED_ZERO"
-                )
 
         position = self.positions.get(symbol)
 
@@ -103,10 +84,6 @@ class ExecutionEngine:
             return self._maybe_enter(symbol, levels, bar_time, high, low, quantity)
 
         return self._evaluate_open(symbol, position, bar_time, high, low, close)
-
-    def _record_rejection_returning_none(self, symbol: str, bar_time: datetime, reason: str):
-        self._record_rejection(symbol, bar_time, reason)
-        return None
 
     def _maybe_enter(
         self,
