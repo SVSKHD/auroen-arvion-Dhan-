@@ -34,11 +34,13 @@ from core.logger import get_logger
 from core.state_store import StateStore
 from core.telegram_bot import TelegramBot
 from core.time_utils import now_ist
+from costs.india_intraday import IndiaIntradayCostModel
 from engine.anchor_engine import AnchorEngine
 from engine.audit import DailyAudit
 from engine.orchestrator import Orchestrator, _SymbolMeta
 from engine.strategy_runner import StrategyConfig
 from risk.guardrails import GuardRails
+from risk.position_sizer import PositionSizer
 
 logger = get_logger("run_dhan")
 
@@ -85,15 +87,19 @@ def _resolve_mode(cli_mode: str) -> str:
 
 def _build_symbols(capital: float) -> list[_SymbolMeta]:
     eligible = CapitalManager(capital).allowed_symbols()
-    return [
-        _SymbolMeta(
+    out: list[_SymbolMeta] = []
+    for s in eligible:
+        strategy_block = s.get("strategy", {}) or {}
+        sl_dist = float(strategy_block.get("sl_dist", cfg.SL_DIST))
+        out.append(_SymbolMeta(
             symbol=s["symbol"],
             security_id=str(s.get("security_id", "")),
             exchange_segment=s.get("segment", "NSE_FNO"),
             lot_size=int(s.get("lot_size", 1)),
-        )
-        for s in eligible
-    ]
+            money_per_point=float(s.get("money_per_point", 1.0)),
+            sl_dist=sl_dist,
+        ))
+    return out
 
 
 def _run_paper(args) -> int:
@@ -108,13 +114,17 @@ def _run_paper(args) -> int:
         max_daily_loss=cfg.MAX_DAILY_LOSS,
         max_trades_per_day=cfg.MAX_TRADES_PER_DAY,
     )
-    audit = DailyAudit(date_iso=now_ist().date().isoformat())
+    audit = DailyAudit(
+        date_iso=now_ist().date().isoformat(),
+        cost_model=IndiaIntradayCostModel(),
+    )
     audit.set_mode("PAPER")
 
     broker = PaperBroker(starting_capital=cfg.MAX_DAILY_LOSS * 50)
-    symbols = _build_symbols(broker.get_account().available_balance)
+    capital = broker.get_account().available_balance
+    symbols = _build_symbols(capital)
     if not symbols:
-        logger.error("No eligible symbols at capital=%.2f", broker.get_account().available_balance)
+        logger.error("No eligible symbols at capital=%.2f", capital)
         return 2
 
     orchestrator = Orchestrator(
@@ -128,6 +138,10 @@ def _run_paper(args) -> int:
         audit=audit,
         no_new_trade_after=_parse_hhmm(cfg.NO_NEW_TRADE_AFTER),
         telegram=TelegramBot() if args.heartbeat else None,
+        position_sizer=PositionSizer(
+            capital=capital,
+            max_risk_pct=cfg.MAX_RISK_PER_TRADE_PCT,
+        ),
     )
     _install_signal_handlers(orchestrator)
 

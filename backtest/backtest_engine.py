@@ -4,6 +4,8 @@ from typing import Optional
 
 import pandas as pd
 
+from costs.india_intraday import IndiaIntradayCostModel, TradeCosts
+from engine.metrics import DrawdownTracker
 from engine.strategy_runner import (
     M1Bar,
     StrategyConfig,
@@ -31,11 +33,23 @@ class BacktestEngine:
     Drives StrategyRunner over OHLC bars grouped by IST trading day. One trade
     per session (first threshold breach). All entry/TP/SL/trailing/square-off
     decisions come from StrategyRunner — no logic is duplicated here.
+
+    Pass A: optional `cost_model` (IndiaIntradayCostModel) charges per-round-
+    trip costs and surfaces gross vs net PnL plus equity curve and drawdown.
+    Optional `symbol_entry` lets a single Backtest run use that symbol's
+    per-symbol StrategyConfig + cost classification.
     """
 
-    def __init__(self, config: StrategyConfig) -> None:
+    def __init__(
+        self,
+        config: StrategyConfig,
+        cost_model: Optional[IndiaIntradayCostModel] = None,
+        symbol_entry: Optional[dict] = None,
+    ) -> None:
         self.config = config
         self.runner = StrategyRunner(config)
+        self.cost_model = cost_model
+        self.symbol_entry = symbol_entry or {}
 
     def run(
         self,
@@ -139,10 +153,6 @@ class BacktestEngine:
 
     @staticmethod
     def _m1_window(session_m1: pd.DataFrame, m5_bar_end: datetime) -> list[M1Bar]:
-        """Return the M1 bars whose timestamps fall inside the M5 window
-        ending at `m5_bar_end`. Convention: an M5 bar timestamped 09:25
-        covers M1 bars 09:20..09:24.
-        """
         window_start = m5_bar_end - pd.Timedelta(minutes=5)
         mask = (session_m1["time"] > window_start) & (session_m1["time"] <= m5_bar_end)
         rows = session_m1[mask]
@@ -164,25 +174,63 @@ class BacktestEngine:
         result.money_pnl = round(result.points_pnl * result.quantity * money_per_point, 2)
         return result
 
-    @staticmethod
+    def _cost_for(self, trade: StrategyTradeResult) -> Optional[TradeCosts]:
+        if self.cost_model is None:
+            return None
+        segment = self.symbol_entry.get("segment", "NSE_FNO")
+        instrument_class = self.symbol_entry.get("instrument_class")
+        return self.cost_model.round_trip_cost(
+            segment=segment,
+            side=trade.side,
+            entry_price=trade.entry_price,
+            exit_price=trade.exit_price,
+            quantity=trade.quantity,
+            instrument_class=instrument_class,
+        )
+
     def _summarize(
+        self,
         trades: list[StrategyTradeResult],
         money_per_point: float,
     ) -> dict:
         wins = sum(1 for t in trades if t.points_pnl > 0)
         losses = sum(1 for t in trades if t.points_pnl <= 0)
         total_points = round(sum(t.points_pnl for t in trades), 2)
-        total_money = round(sum(t.money_pnl for t in trades), 2)
+        total_gross = round(sum(t.money_pnl for t in trades), 2)
         win_rate = round((wins / len(trades)) * 100, 2) if trades else 0.0
 
+        # Per-trade costs and net PnL via shared DrawdownTracker.
+        dd = DrawdownTracker()
+        trade_records: list[dict] = []
+        total_costs = 0.0
+        for t in trades:
+            tc = self._cost_for(t)
+            net = round(t.money_pnl - (tc.total if tc else 0.0), 2)
+            if tc is not None:
+                total_costs = round(total_costs + tc.total, 2)
+            dd.record(net, t.exit_time.isoformat())
+            record = StrategyRunner.serialize_trade(t)
+            record["costs"] = tc.as_dict() if tc is not None else None
+            record["net_money_pnl"] = net
+            trade_records.append(record)
+
+        total_net = round(total_gross - total_costs, 2)
         return {
             "trades": len(trades),
             "wins": wins,
             "losses": losses,
             "win_rate": win_rate,
             "total_points_pnl": total_points,
-            "total_money_pnl": total_money,
+            "total_gross_pnl": total_gross,
+            "total_net_pnl": total_net,
+            "total_costs": total_costs,
+            # Phase 5 compat: callers consuming the old key keep working.
+            "total_money_pnl": total_gross,
             "money_per_point": money_per_point,
-            "profitable": total_money > 0,
-            "trade_results": [StrategyRunner.serialize_trade(t) for t in trades],
+            "profitable": total_net > 0,
+            "max_drawdown_money": dd.max_drawdown_money,
+            "max_drawdown_pct": dd.max_drawdown_pct,
+            "equity_curve": list(dd.equity_curve),
+            "cost_model_attached": self.cost_model is not None,
+            "trade_results": trade_records,
         }
