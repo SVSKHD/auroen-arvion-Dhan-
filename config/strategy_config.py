@@ -4,8 +4,10 @@ from engine.strategy_runner import StrategyConfig
 
 MODE = "PAPER"  # PAPER or LIVE
 
-ANCHOR_TIME = "09:20"
+ANCHOR_TIME = "09:15"
 SQUARE_OFF_TIME = "15:15"
+NO_NEW_TRADE_AFTER = "14:30"
+ANCHOR_CAPTURE_WINDOW_SECONDS = 30
 
 TRIGGER_DIST = 20.0
 TP_DIST = 30.0
