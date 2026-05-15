@@ -5,6 +5,7 @@ from typing import Optional
 import pandas as pd
 
 from engine.strategy_runner import (
+    M1Bar,
     StrategyConfig,
     StrategyPosition,
     StrategyRunner,
@@ -41,33 +42,45 @@ class BacktestEngine:
         csv_path: str,
         quantity: int = 1,
         money_per_point: float = 1.0,
+        m1_csv_path: Optional[str] = None,
     ) -> dict:
-        df = pd.read_csv(csv_path)
-
-        if "time" not in df.columns:
-            raise ValueError("CSV must contain 'time' column")
-
-        required_cols = {"time", "open", "high", "low", "close"}
-        missing = required_cols - set(df.columns)
-        if missing:
-            raise ValueError(f"CSV missing columns: {sorted(missing)}")
-
-        df["time"] = pd.to_datetime(df["time"])
-        df["date"] = df["time"].dt.date
+        df = self._load_ohlc(csv_path)
+        m1_df: Optional[pd.DataFrame] = (
+            self._load_ohlc(m1_csv_path) if m1_csv_path is not None else None
+        )
 
         trades: list[StrategyTradeResult] = []
 
-        for _, session_df in df.groupby("date"):
+        for session_date, session_df in df.groupby("date"):
             session_df = session_df.sort_values("time").reset_index(drop=True)
-            trade = self._run_session(session_df, quantity, money_per_point)
+            session_m1 = (
+                m1_df[m1_df["date"] == session_date].sort_values("time").reset_index(drop=True)
+                if m1_df is not None
+                else None
+            )
+            trade = self._run_session(session_df, session_m1, quantity, money_per_point)
             if trade is not None:
                 trades.append(trade)
 
         return self._summarize(trades, money_per_point)
 
+    @staticmethod
+    def _load_ohlc(csv_path: str) -> pd.DataFrame:
+        df = pd.read_csv(csv_path)
+        if "time" not in df.columns:
+            raise ValueError("CSV must contain 'time' column")
+        required_cols = {"time", "open", "high", "low", "close"}
+        missing = required_cols - set(df.columns)
+        if missing:
+            raise ValueError(f"CSV missing columns: {sorted(missing)}")
+        df["time"] = pd.to_datetime(df["time"])
+        df["date"] = df["time"].dt.date
+        return df
+
     def _run_session(
         self,
         session_df: pd.DataFrame,
+        session_m1: Optional[pd.DataFrame],
         quantity: int,
         money_per_point: float,
     ) -> Optional[StrategyTradeResult]:
@@ -85,6 +98,7 @@ class BacktestEngine:
         levels = self.runner.build_levels(anchor_price)
 
         position: Optional[StrategyPosition] = None
+        entry_bar_time: Optional[datetime] = None
 
         for i in range(anchor_idx + 1, len(session_df)):
             row = session_df.iloc[i]
@@ -102,19 +116,45 @@ class BacktestEngine:
                     low=low,
                     quantity=quantity,
                 )
+                if position is not None:
+                    entry_bar_time = bar_time
                 continue
 
-            result = self.runner.evaluate_exit(
-                position=position,
-                bar_time=bar_time,
-                high=high,
-                low=low,
-                close=close,
-            )
+            if session_m1 is not None:
+                m1_bars = self._m1_window(session_m1, bar_time)
+                result = self.runner.replay_intra_bar(position, m1_bars)
+            else:
+                result = self.runner.evaluate_exit(
+                    position=position,
+                    bar_time=bar_time,
+                    high=high,
+                    low=low,
+                    close=close,
+                )
             if result is not None:
                 return self._apply_money(result, money_per_point)
 
+        _ = entry_bar_time
         return None
+
+    @staticmethod
+    def _m1_window(session_m1: pd.DataFrame, m5_bar_end: datetime) -> list[M1Bar]:
+        """Return the M1 bars whose timestamps fall inside the M5 window
+        ending at `m5_bar_end`. Convention: an M5 bar timestamped 09:25
+        covers M1 bars 09:20..09:24.
+        """
+        window_start = m5_bar_end - pd.Timedelta(minutes=5)
+        mask = (session_m1["time"] > window_start) & (session_m1["time"] <= m5_bar_end)
+        rows = session_m1[mask]
+        return [
+            M1Bar(
+                bar_time=r["time"].to_pydatetime(),
+                high=float(r["high"]),
+                low=float(r["low"]),
+                close=float(r["close"]),
+            )
+            for _, r in rows.iterrows()
+        ]
 
     @staticmethod
     def _apply_money(

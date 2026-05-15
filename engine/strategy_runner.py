@@ -1,11 +1,12 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime, time
-from typing import Literal, Optional
+from typing import Iterable, Literal, Optional
 
 from strategy.levels import OrderLevels, build_order_levels
 
 Side = Literal["LONG", "SHORT"]
 ExitReason = Literal["TP", "SL", "TRAIL", "SQUARE_OFF"]
+BarResolution = Literal["M5", "M1"]
 
 
 @dataclass
@@ -19,6 +20,15 @@ class StrategyConfig:
     square_off_time: time = time(15, 15)
     tick_size: float = 0.05
     sl_first_on_ambiguous_bar: bool = True
+    bar_resolution: BarResolution = "M5"
+
+
+@dataclass
+class M1Bar:
+    bar_time: datetime
+    high: float
+    low: float
+    close: float
 
 
 @dataclass
@@ -109,11 +119,17 @@ class StrategyRunner:
             sl=levels.short_sl,
         )
 
-    def update_trailing(self, position: StrategyPosition, high: float, low: float) -> None:
+    def update_trailing_from_close(self, position: StrategyPosition, close: float) -> None:
+        """Path-safe ratchet: only uses realized close, never within-bar extremes.
+
+        Called AFTER the exit check so the SL applied on the next bar reflects
+        only fully-printed close prices. Using high/low here is what produced
+        the phantom intra-bar trail exits in the pre-fix runner.
+        """
         if position.side == "LONG":
-            favorable = high - position.entry_price
+            favorable = close - position.entry_price
         else:
-            favorable = position.entry_price - low
+            favorable = position.entry_price - close
 
         if favorable < self.config.lock_step:
             return
@@ -127,7 +143,7 @@ class StrategyRunner:
 
         position.lock_idx = new_idx
 
-        # Safer rule: first lock moves to breakeven; next locks secure profit.
+        # First lock (idx=0) sits at breakeven; subsequent locks secure profit.
         lock_profit = self.config.lock_step * position.lock_idx
 
         if position.side == "LONG":
@@ -143,40 +159,25 @@ class StrategyRunner:
         low: float,
         close: float,
     ) -> Optional[StrategyTradeResult]:
-        self.update_trailing(position, high=high, low=low)
-
+        """Exit check then close-based trail. Order matters: exit uses the SL
+        carried in from the previous bar's close, then the trail updates SL
+        from this bar's close for the NEXT bar. This eliminates the within-bar
+        look-ahead where ratcheting off `high` was compared against `low`.
+        """
         if position.side == "LONG":
             sl_hit = low <= position.sl
             tp_hit = high >= position.tp
-
-            if sl_hit and tp_hit:
-                exit_price = position.sl if self.config.sl_first_on_ambiguous_bar else position.tp
-                reason: ExitReason = "SL" if self.config.sl_first_on_ambiguous_bar else "TP"
-                return self._result(position, exit_price, bar_time, reason)
-
-            if sl_hit:
-                reason = "TRAIL" if position.lock_idx >= 0 and position.sl >= position.entry_price else "SL"
-                return self._result(position, position.sl, bar_time, reason)
-
-            if tp_hit:
-                return self._result(position, position.tp, bar_time, "TP")
-
-            if bar_time.time() >= self.config.square_off_time:
-                return self._result(position, close, bar_time, "SQUARE_OFF")
-
-            return None
-
-        sl_hit = high >= position.sl
-        tp_hit = low <= position.tp
+        else:
+            sl_hit = high >= position.sl
+            tp_hit = low <= position.tp
 
         if sl_hit and tp_hit:
-            exit_price = position.sl if self.config.sl_first_on_ambiguous_bar else position.tp
-            reason = "SL" if self.config.sl_first_on_ambiguous_bar else "TP"
-            return self._result(position, exit_price, bar_time, reason)
+            if self.config.sl_first_on_ambiguous_bar:
+                return self._result(position, position.sl, bar_time, self._sl_reason(position))
+            return self._result(position, position.tp, bar_time, "TP")
 
         if sl_hit:
-            reason = "TRAIL" if position.lock_idx >= 0 and position.sl <= position.entry_price else "SL"
-            return self._result(position, position.sl, bar_time, reason)
+            return self._result(position, position.sl, bar_time, self._sl_reason(position))
 
         if tp_hit:
             return self._result(position, position.tp, bar_time, "TP")
@@ -184,7 +185,38 @@ class StrategyRunner:
         if bar_time.time() >= self.config.square_off_time:
             return self._result(position, close, bar_time, "SQUARE_OFF")
 
+        self.update_trailing_from_close(position, close)
         return None
+
+    def replay_intra_bar(
+        self,
+        position: StrategyPosition,
+        m1_bars: Iterable[M1Bar],
+    ) -> Optional[StrategyTradeResult]:
+        """Drive evaluate_exit over a sequence of M1 sub-bars covering an M5
+        window. Each M1 bar is path-safe on its own (close-lagged trail), and
+        finer granularity bounds the residual within-bar uncertainty to ~1
+        minute of price action. Returns the first exit, or None if the
+        position survives the replay.
+        """
+        for bar in m1_bars:
+            result = self.evaluate_exit(
+                position=position,
+                bar_time=bar.bar_time,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+            )
+            if result is not None:
+                return result
+        return None
+
+    def _sl_reason(self, position: StrategyPosition) -> ExitReason:
+        if position.lock_idx < 0:
+            return "SL"
+        if position.side == "LONG":
+            return "TRAIL" if position.sl >= position.entry_price else "SL"
+        return "TRAIL" if position.sl <= position.entry_price else "SL"
 
     def _result(
         self,
