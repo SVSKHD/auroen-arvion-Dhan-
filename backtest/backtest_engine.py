@@ -1,10 +1,11 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
 
 from engine.strategy_runner import (
+    M1Bar,
     StrategyConfig,
     StrategyPosition,
     StrategyRunner,
@@ -41,33 +42,39 @@ class BacktestEngine:
         csv_path: str,
         quantity: int = 1,
         money_per_point: float = 1.0,
+        m1_csv_path: Optional[str] = None,
     ) -> dict:
-        df = pd.read_csv(csv_path)
-
-        if "time" not in df.columns:
-            raise ValueError("CSV must contain 'time' column")
-
-        required_cols = {"time", "open", "high", "low", "close"}
-        missing = required_cols - set(df.columns)
-        if missing:
-            raise ValueError(f"CSV missing columns: {sorted(missing)}")
-
-        df["time"] = pd.to_datetime(df["time"])
-        df["date"] = df["time"].dt.date
+        df = self._read_bars(csv_path)
+        m1_df = self._read_bars(m1_csv_path) if m1_csv_path else None
 
         trades: list[StrategyTradeResult] = []
 
-        for _, session_df in df.groupby("date"):
+        for date_key, session_df in df.groupby("date"):
             session_df = session_df.sort_values("time").reset_index(drop=True)
-            trade = self._run_session(session_df, quantity, money_per_point)
+            m1_session = None
+            if m1_df is not None:
+                m1_session = m1_df[m1_df["date"] == date_key].sort_values("time").reset_index(drop=True)
+            trade = self._run_session(session_df, m1_session, quantity, money_per_point)
             if trade is not None:
                 trades.append(trade)
 
         return self._summarize(trades, money_per_point)
 
+    @staticmethod
+    def _read_bars(csv_path: str) -> pd.DataFrame:
+        df = pd.read_csv(csv_path)
+        required = {"time", "open", "high", "low", "close"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"CSV missing columns: {sorted(missing)}")
+        df["time"] = pd.to_datetime(df["time"])
+        df["date"] = df["time"].dt.date
+        return df
+
     def _run_session(
         self,
         session_df: pd.DataFrame,
+        m1_session: Optional[pd.DataFrame],
         quantity: int,
         money_per_point: float,
     ) -> Optional[StrategyTradeResult]:
@@ -104,17 +111,49 @@ class BacktestEngine:
                 )
                 continue
 
-            result = self.runner.evaluate_exit(
-                position=position,
-                bar_time=bar_time,
-                high=high,
-                low=low,
-                close=close,
-            )
+            result = self._evaluate_bar(position, m1_session, bar_time, high, low, close)
             if result is not None:
                 return self._apply_money(result, money_per_point)
 
         return None
+
+    def _evaluate_bar(
+        self,
+        position: StrategyPosition,
+        m1_session: Optional[pd.DataFrame],
+        bar_time: datetime,
+        high: float,
+        low: float,
+        close: float,
+    ) -> Optional[StrategyTradeResult]:
+        if self.config.bar_resolution == "M1" and m1_session is not None:
+            sub_bars = self._m1_sub_bars(m1_session, bar_time)
+            if sub_bars:
+                return self.runner.replay_intra_bar(position, sub_bars)
+        return self.runner.evaluate_exit(
+            position=position,
+            bar_time=bar_time,
+            high=high,
+            low=low,
+            close=close,
+        )
+
+    @staticmethod
+    def _m1_sub_bars(m1_session: pd.DataFrame, m5_bar_time: datetime) -> list[M1Bar]:
+        window_start = m5_bar_time
+        window_end = m5_bar_time + timedelta(minutes=5)
+        mask = (m1_session["time"] >= window_start) & (m1_session["time"] < window_end)
+        rows = m1_session[mask]
+        return [
+            M1Bar(
+                time=row["time"].to_pydatetime(),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+            )
+            for _, row in rows.iterrows()
+        ]
 
     @staticmethod
     def _apply_money(

@@ -1,11 +1,12 @@
 from dataclasses import asdict, dataclass
 from datetime import datetime, time
-from typing import Literal, Optional
+from typing import Iterable, Literal, Optional
 
 from strategy.levels import OrderLevels, build_order_levels
 
 Side = Literal["LONG", "SHORT"]
 ExitReason = Literal["TP", "SL", "TRAIL", "SQUARE_OFF"]
+BarResolution = Literal["M5", "M1"]
 
 
 @dataclass
@@ -19,6 +20,7 @@ class StrategyConfig:
     square_off_time: time = time(15, 15)
     tick_size: float = 0.05
     sl_first_on_ambiguous_bar: bool = True
+    bar_resolution: BarResolution = "M5"
 
 
 @dataclass
@@ -49,11 +51,31 @@ class StrategyTradeResult:
     lock_idx: int
 
 
+@dataclass
+class M1Bar:
+    """One-minute bar used for intra-M5 replay."""
+    time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+
+
 class StrategyRunner:
     """Single source of truth for anchor-breakout behavior.
 
-    BACKTEST, PAPER, and LIVE should all use this class for signal, TP/SL,
-    trailing-lock, and square-off rules. Only price source and order sink differ.
+    BACKTEST, PAPER, and LIVE all route through this class.
+
+    Phase 2 fix: trailing no longer ratchets off intra-bar high before exit
+    check on the same bar (look-ahead bug). The new model:
+
+    - Exits are evaluated FIRST against the SL that was valid coming into
+      the bar.
+    - Then the SL ratchets one step at most, using a single reference price
+      (bar close in M5 mode, sub-bar close in M1 mode). One-step-per-ratchet
+      cap is conservative and makes the trailing path-safe.
+    - For tighter accuracy, M1 mode is available: call replay_intra_bar
+      with the M1 sub-bars that fall inside the M5 bar.
     """
 
     def __init__(self, config: StrategyConfig) -> None:
@@ -83,8 +105,7 @@ class StrategyRunner:
         if not long_hit and not short_hit:
             return None
 
-        # Same candle hit both triggers: avoid fantasy edge. Skip trade because
-        # OHLC candles cannot prove which side triggered first.
+        # Same bar hit both triggers: cannot prove sequence from OHLC.
         if long_hit and short_hit:
             return None
 
@@ -109,25 +130,34 @@ class StrategyRunner:
             sl=levels.short_sl,
         )
 
-    def update_trailing(self, position: StrategyPosition, high: float, low: float) -> None:
+    def update_trailing(self, position: StrategyPosition, ratchet_price: float) -> None:
+        """Advance lock at most one step using ratchet_price (typically a close).
+
+        Public API change (Phase 2): was update_trailing(position, high, low).
+        Callers must pass a single reference price — the bar close in M5 mode
+        or sub-bar close in M1 mode. One-step advancement is conservative;
+        repeated calls (per sub-bar) walk the lock forward.
+
+        Lock convention:
+          idx == -1 -> no lock (SL at initial stop distance)
+          idx ==  0 -> SL at breakeven (entry)
+          idx ==  k -> SL at entry + k * lock_step (LONG) or entry - k * lock_step (SHORT)
+        """
         if position.side == "LONG":
-            favorable = high - position.entry_price
+            favorable = ratchet_price - position.entry_price
         else:
-            favorable = position.entry_price - low
+            favorable = position.entry_price - ratchet_price
 
         if favorable < self.config.lock_step:
             return
 
         position.max_favorable_move = max(position.max_favorable_move, favorable)
-        new_idx = int(position.max_favorable_move // self.config.lock_step) - 1
-        new_idx = min(new_idx, self.config.lock_steps_count - 1)
 
-        if new_idx <= position.lock_idx:
+        next_idx = position.lock_idx + 1
+        if next_idx >= self.config.lock_steps_count:
             return
 
-        position.lock_idx = new_idx
-
-        # Safer rule: first lock moves to breakeven; next locks secure profit.
+        position.lock_idx = next_idx
         lock_profit = self.config.lock_step * position.lock_idx
 
         if position.side == "LONG":
@@ -143,8 +173,46 @@ class StrategyRunner:
         low: float,
         close: float,
     ) -> Optional[StrategyTradeResult]:
-        self.update_trailing(position, high=high, low=low)
+        """Evaluate exit for one M5 bar.
 
+        In M5 mode this also ratchets trailing off the bar close AFTER the
+        exit check. In M1 mode it only checks exits — call replay_intra_bar
+        if you have M1 data for the same M5 window.
+        """
+        result = self._check_exits(position, bar_time, high, low, close)
+        if result is not None:
+            return result
+
+        if self.config.bar_resolution == "M5":
+            self.update_trailing(position, ratchet_price=close)
+
+        return None
+
+    def replay_intra_bar(
+        self,
+        position: StrategyPosition,
+        m1_bars: Iterable[M1Bar],
+    ) -> Optional[StrategyTradeResult]:
+        """Drive exit + trailing across M1 sub-bars that compose one M5 bar.
+
+        Per sub-bar: exit check against current SL, then ratchet off the
+        sub-bar close. First sub-bar SL hit / TP hit / square-off wins.
+        """
+        for sub in m1_bars:
+            result = self._check_exits(position, sub.time, sub.high, sub.low, sub.close)
+            if result is not None:
+                return result
+            self.update_trailing(position, ratchet_price=sub.close)
+        return None
+
+    def _check_exits(
+        self,
+        position: StrategyPosition,
+        bar_time: datetime,
+        high: float,
+        low: float,
+        close: float,
+    ) -> Optional[StrategyTradeResult]:
         if position.side == "LONG":
             sl_hit = low <= position.sl
             tp_hit = high >= position.tp
@@ -152,6 +220,8 @@ class StrategyRunner:
             if sl_hit and tp_hit:
                 exit_price = position.sl if self.config.sl_first_on_ambiguous_bar else position.tp
                 reason: ExitReason = "SL" if self.config.sl_first_on_ambiguous_bar else "TP"
+                if reason == "SL" and position.lock_idx >= 0 and position.sl >= position.entry_price:
+                    reason = "TRAIL"
                 return self._result(position, exit_price, bar_time, reason)
 
             if sl_hit:
@@ -172,6 +242,8 @@ class StrategyRunner:
         if sl_hit and tp_hit:
             exit_price = position.sl if self.config.sl_first_on_ambiguous_bar else position.tp
             reason = "SL" if self.config.sl_first_on_ambiguous_bar else "TP"
+            if reason == "SL" and position.lock_idx >= 0 and position.sl <= position.entry_price:
+                reason = "TRAIL"
             return self._result(position, exit_price, bar_time, reason)
 
         if sl_hit:
