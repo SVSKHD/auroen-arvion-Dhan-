@@ -1,3 +1,7 @@
+from datetime import time
+
+from engine.strategy_runner import StrategyConfig
+
 MODE = "PAPER"  # PAPER or LIVE
 
 ANCHOR_TIME = "09:20"
@@ -10,7 +14,11 @@ SL_DIST = 40.0
 LOCK_STEP = 5.0
 LOCK_STEPS_COUNT = 6
 
+TICK_SIZE = 0.05
+
 MAX_RISK_PER_TRADE_PCT = 1.0
+MAX_DAILY_LOSS = 5000.0
+MAX_TRADES_PER_DAY = 3
 
 SUPPORTED_SYMBOLS = [
     {
@@ -35,3 +43,21 @@ SUPPORTED_SYMBOLS = [
         "lot_size": 1,
     },
 ]
+
+
+def _parse_hhmm(value: str) -> time:
+    hh, mm = value.split(":")
+    return time(int(hh), int(mm))
+
+
+def build_default_strategy_config() -> StrategyConfig:
+    return StrategyConfig(
+        trigger_dist=TRIGGER_DIST,
+        tp_dist=TP_DIST,
+        sl_dist=SL_DIST,
+        lock_step=LOCK_STEP,
+        lock_steps_count=LOCK_STEPS_COUNT,
+        anchor_time=_parse_hhmm(ANCHOR_TIME),
+        square_off_time=_parse_hhmm(SQUARE_OFF_TIME),
+        tick_size=TICK_SIZE,
+    )
