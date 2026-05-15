@@ -117,12 +117,14 @@ class AnchorEngine:
         self._persist()
 
         logger.info(
-            "ANCHOR | day=%s symbol=%s price=%.2f source_bar=%s captured_at=%s",
-            self._current_day_iso,
-            symbol,
-            anchor_price,
-            source_bar_time.isoformat(),
-            now.isoformat(),
+            "anchor_captured",
+            extra={
+                "day": self._current_day_iso,
+                "symbol": symbol,
+                "anchor_price": anchor_price,
+                "source_bar": source_bar_time.isoformat(),
+                "captured_at": now.isoformat(),
+            },
         )
         return record
 

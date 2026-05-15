@@ -106,6 +106,7 @@ class Orchestrator:
         pre_squareoff_buffer_minutes: int = 5,
         telegram=None,
         position_sizer: Optional[PositionSizer] = None,
+        status_store: Optional[StateStore] = None,
     ) -> None:
         self.mode = mode
         self.broker = broker
@@ -120,6 +121,10 @@ class Orchestrator:
         self.pre_squareoff_buffer = timedelta(minutes=pre_squareoff_buffer_minutes)
         self.telegram = telegram
         self.position_sizer = position_sizer
+        # Pass B: live runtime status (read by api/server.py /status,
+        # /heartbeat, and the Telegram poller) lives in execution_state.json
+        # so the dashboard only needs to know one store.
+        self.status_store = status_store or StateStore("execution_state.json")
 
         self.rolling_bars: dict[str, _RollingBar] = {}
         self.oco_pairs: dict[str, _OcoPair] = {}
@@ -129,6 +134,9 @@ class Orchestrator:
         self._last_heartbeat_at: Optional[datetime] = None
         self._squared_off_today: set[str] = set()
         self._pre_squareoff_cancelled = False
+        self.paused: bool = False  # /pause / /resume from Telegram
+        self._last_tick_at: Optional[datetime] = None
+        self._last_anchor_at: Optional[datetime] = None
 
         self._reload_oco_pairs()
         self.audit.set_mode(mode)
@@ -142,6 +150,7 @@ class Orchestrator:
         if symbol not in self.symbols:
             return
         now = now or now_ist()
+        self._last_tick_at = now
 
         # Boundary detection must run BEFORE the rolling bar is rolled,
         # so we can read the just-closed bar's close.
@@ -156,6 +165,41 @@ class Orchestrator:
         self._pre_squareoff_sweep(now)
         self._squareoff_at_close(symbol, ltp, now)
         self._maybe_heartbeat(now)
+        self._publish_status(now)
+
+    def status_snapshot(self) -> dict:
+        """The same dict shape we write to execution_state.json:status.
+
+        Used by the Telegram poller via status_provider and by tests.
+        """
+        return {
+            "ts_ist": (self._last_tick_at or now_ist()).isoformat(),
+            "mode": self.mode,
+            "symbols": list(self.symbols.keys()),
+            "paused": self.paused,
+            "healthy": self._last_tick_at is not None,
+            "last_tick_at": self._last_tick_at.isoformat() if self._last_tick_at else None,
+            "last_anchor_at": self._last_anchor_at.isoformat() if self._last_anchor_at else None,
+            "day_pnl": round(self.day_pnl, 2),
+            "day_trades": self.day_trades,
+            "positions": {
+                sym: {
+                    "side": p.side,
+                    "entry_price": p.entry_price,
+                    "quantity": p.quantity,
+                    "sl": p.sl,
+                    "tp": p.tp,
+                    "lock_idx": p.lock_idx,
+                }
+                for sym, p in self.positions.items()
+            },
+            "open_oco_pairs": sorted(self.oco_pairs.keys()),
+        }
+
+    def _publish_status(self, now: datetime) -> None:
+        payload = self.status_store.load()
+        payload["status"] = self.status_snapshot()
+        self.status_store.save(payload)
 
     def shutdown(self) -> None:
         """Graceful shutdown.
@@ -171,6 +215,8 @@ class Orchestrator:
             for pair in list(self.oco_pairs.values()):
                 self.broker.cancel_order(pair.long_order_id)
                 self.broker.cancel_order(pair.short_order_id)
+        # Final status write so the dashboard reflects the shutdown.
+        self._publish_status(now_ist())
         self.audit.flush(state_store=self.state_store)
 
     # ----------------------------------------------------------- rolling bar
@@ -204,6 +250,7 @@ class Orchestrator:
             source_bar_time=source_bar_time,
             now=now,
         )
+        self._last_anchor_at = now
         self.audit.set_anchor(symbol, record.anchor_price)
         self.audit.emit("anchor_captured", symbol, {
             "anchor_price": record.anchor_price,
@@ -219,6 +266,9 @@ class Orchestrator:
         if symbol in self.positions:
             return
         if now.time() >= self.no_new_trade_after:
+            return
+        if self.paused:
+            self.audit.emit("guardrail_blocked", symbol, {"reason": "paused_via_telegram"})
             return
         record = self.anchor_engine.get_anchor(symbol, now=now)
         if record is None:
@@ -314,17 +364,17 @@ class Orchestrator:
         )
         if decision.skipped:
             logger.warning(
-                "Position size 0 for %s: capital=%.2f risk_budget=%.2f "
-                "per_lot_risk=%.2f sl_dist=%.2f money_per_point=%.2f "
-                "lot_size=%d reason=%s",
-                symbol,
-                self.position_sizer.capital,
-                decision.risk_budget,
-                decision.per_lot_risk,
-                sl_dist,
-                meta.money_per_point,
-                meta.lot_size,
-                decision.skipped_reason,
+                "position_size_zero",
+                extra={
+                    "symbol": symbol,
+                    "capital": self.position_sizer.capital,
+                    "risk_budget": decision.risk_budget,
+                    "per_lot_risk": decision.per_lot_risk,
+                    "sl_dist": sl_dist,
+                    "money_per_point": meta.money_per_point,
+                    "lot_size": meta.lot_size,
+                    "sizer_reason": decision.skipped_reason,
+                },
             )
             self.audit.emit("guardrail_blocked", symbol, {
                 "reason": "position_size_zero",
