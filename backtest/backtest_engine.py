@@ -4,6 +4,7 @@ from typing import Optional
 
 import pandas as pd
 
+from costs.india_intraday import CostBreakdown, CostRates, round_trip_cost
 from engine.strategy_runner import (
     M1Bar,
     StrategyConfig,
@@ -43,6 +44,8 @@ class BacktestEngine:
         quantity: int = 1,
         money_per_point: float = 1.0,
         m1_csv_path: Optional[str] = None,
+        instrument_class: Optional[str] = None,
+        cost_rates: Optional[CostRates] = None,
     ) -> dict:
         df = self._load_ohlc(csv_path)
         m1_df: Optional[pd.DataFrame] = (
@@ -50,6 +53,7 @@ class BacktestEngine:
         )
 
         trades: list[StrategyTradeResult] = []
+        cost_breakdowns: list[CostBreakdown] = []
 
         for session_date, session_df in df.groupby("date"):
             session_df = session_df.sort_values("time").reset_index(drop=True)
@@ -61,8 +65,18 @@ class BacktestEngine:
             trade = self._run_session(session_df, session_m1, quantity, money_per_point)
             if trade is not None:
                 trades.append(trade)
+                if instrument_class is not None:
+                    cost_breakdowns.append(round_trip_cost(
+                        entry_price=trade.entry_price,
+                        exit_price=trade.exit_price,
+                        quantity=trade.quantity,
+                        instrument_class=instrument_class,
+                        rates=cost_rates,
+                    ))
+                else:
+                    cost_breakdowns.append(CostBreakdown())
 
-        return self._summarize(trades, money_per_point)
+        return self._summarize(trades, money_per_point, cost_breakdowns)
 
     @staticmethod
     def _load_ohlc(csv_path: str) -> pd.DataFrame:
@@ -168,12 +182,42 @@ class BacktestEngine:
     def _summarize(
         trades: list[StrategyTradeResult],
         money_per_point: float,
+        cost_breakdowns: Optional[list[CostBreakdown]] = None,
     ) -> dict:
         wins = sum(1 for t in trades if t.points_pnl > 0)
         losses = sum(1 for t in trades if t.points_pnl <= 0)
         total_points = round(sum(t.points_pnl for t in trades), 2)
-        total_money = round(sum(t.money_pnl for t in trades), 2)
+        gross_money = round(sum(t.money_pnl for t in trades), 2)
         win_rate = round((wins / len(trades)) * 100, 2) if trades else 0.0
+
+        cost_breakdowns = cost_breakdowns or [CostBreakdown() for _ in trades]
+        total_costs = round(sum(c.total for c in cost_breakdowns), 2)
+        net_money = round(gross_money - total_costs, 2)
+
+        # Equity curve: cumulative net PnL after each trade.
+        equity_curve: list[tuple[str, float]] = []
+        cumulative_net = 0.0
+        max_drawdown = 0.0
+        peak = 0.0
+        for t, c in zip(trades, cost_breakdowns):
+            cumulative_net += t.money_pnl - c.total
+            equity_curve.append((t.exit_time.isoformat(), round(cumulative_net, 2)))
+            if cumulative_net > peak:
+                peak = cumulative_net
+            drawdown = peak - cumulative_net
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+
+        max_drawdown_pct = (
+            round((max_drawdown / peak) * 100, 2) if peak > 0 else 0.0
+        )
+
+        trade_records = []
+        for t, c in zip(trades, cost_breakdowns):
+            record = StrategyRunner.serialize_trade(t)
+            record["cost_breakdown"] = c.as_dict()
+            record["net_money_pnl"] = round(t.money_pnl - c.total, 2)
+            trade_records.append(record)
 
         return {
             "trades": len(trades),
@@ -181,8 +225,16 @@ class BacktestEngine:
             "losses": losses,
             "win_rate": win_rate,
             "total_points_pnl": total_points,
-            "total_money_pnl": total_money,
+            "gross_pnl": gross_money,
+            "net_pnl": net_money,
+            "total_costs": total_costs,
+            # Pre-Phase-6 callers consume `total_money_pnl`; preserve it
+            # so the parity test and the CLI summary keep working.
+            "total_money_pnl": gross_money,
             "money_per_point": money_per_point,
-            "profitable": total_money > 0,
-            "trade_results": [StrategyRunner.serialize_trade(t) for t in trades],
+            "profitable": net_money > 0,
+            "max_drawdown_money": round(max_drawdown, 2),
+            "max_drawdown_pct": max_drawdown_pct,
+            "equity_curve": equity_curve,
+            "trade_results": trade_records,
         }
