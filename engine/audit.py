@@ -11,12 +11,17 @@ Per Phase 5 brief: every market day produces three artifacts under
                          on every event.
   - daily_summary.json — end-of-day metrics: per-symbol trades,
                          gross_pnl, net_pnl, win/loss, max_drawdown,
-                         anchor, square_off_time.
+                         equity_curve, anchor, square_off_time.
   - state_snapshot.json — final StateStore snapshot.
 
-Append-only means events.jsonl tolerates a mid-session crash without
-losing prior events; the summary and snapshot are written via the atomic
-StateStore (tmp + os.replace) at end-of-day or on graceful shutdown.
+Pass A: net_pnl is gross minus India intraday costs (via
+IndiaIntradayCostModel injected on construction). If the cost model is
+None, net_pnl == gross_pnl and the caller is warned at construction
+time — a stale net_pnl number is more dangerous than an explicit
+"costs not modelled" signal.
+
+Drawdown + equity-curve bookkeeping shared with `BacktestEngine`
+through `engine.metrics.DrawdownTracker`.
 """
 
 import json
@@ -27,6 +32,7 @@ from typing import Any, Optional
 from core.logger import get_logger
 from core.state_store import StateStore
 from core.time_utils import now_ist
+from engine.metrics import DrawdownTracker
 
 logger = get_logger("audit")
 
@@ -42,6 +48,11 @@ class TradeSnapshot:
     points_pnl: float
     money_pnl: float
     exit_reason: str
+    quantity: int = 0
+    segment: str = ""
+    instrument_class: str = ""
+    costs: Optional[dict] = None  # TradeCosts.as_dict() when cost model attached
+    net_money_pnl: float = 0.0
 
 
 @dataclass
@@ -51,15 +62,27 @@ class DailyMetrics:
     trades: list[TradeSnapshot] = field(default_factory=list)
     gross_pnl: float = 0.0
     net_pnl: float = 0.0
+    total_costs: float = 0.0
     wins: int = 0
     losses: int = 0
-    max_drawdown: float = 0.0
+    max_drawdown_money: float = 0.0
+    max_drawdown_pct: float = 0.0
+    equity_curve: list[tuple[str, float]] = field(default_factory=list)
     square_off_time: Optional[str] = None
     mode: str = "PAPER"
 
 
 class DailyAudit:
-    def __init__(self, date_iso: str, root: Path = AUDIT_ROOT) -> None:
+    def __init__(
+        self,
+        date_iso: str,
+        root: Path = AUDIT_ROOT,
+        cost_model=None,
+    ) -> None:
+        """`cost_model` is an `IndiaIntradayCostModel` (or test double with the
+        same `round_trip_cost` signature). When omitted, net_pnl == gross_pnl
+        and a one-shot warning is logged.
+        """
         self.date_iso = date_iso
         self.dir = root / date_iso
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -67,7 +90,14 @@ class DailyAudit:
         self.summary_path = self.dir / "daily_summary.json"
         self.snapshot_path = self.dir / "state_snapshot.json"
         self.metrics = DailyMetrics(date_iso=date_iso)
-        self._running_low_pnl = 0.0  # for drawdown calc
+        self.cost_model = cost_model
+        self._drawdown = DrawdownTracker()
+        if cost_model is None:
+            logger.warning(
+                "DailyAudit constructed without a cost_model: net_pnl will "
+                "equal gross_pnl. Pass an IndiaIntradayCostModel for "
+                "production accounting."
+            )
 
     # ---- events.jsonl (append-only) ----
 
@@ -78,29 +108,48 @@ class DailyAudit:
             "symbol": symbol,
             "payload": payload,
         })
-        # Open per-event so a crash mid-session does not lose the prior
-        # events. Cost is acceptable: well under tick rate.
         with open(self.events_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
     # ---- metrics accumulation ----
 
-    def record_trade(self, trade: TradeSnapshot) -> None:
+    def record_trade(
+        self,
+        trade: TradeSnapshot,
+        exit_ts_iso: Optional[str] = None,
+    ) -> None:
+        # Apply cost model if attached. We compute costs at record time so
+        # callers don't have to know the model exists.
+        if self.cost_model is not None and trade.quantity > 0:
+            tc = self.cost_model.round_trip_cost(
+                segment=trade.segment,
+                side=trade.side,
+                entry_price=trade.entry_price,
+                exit_price=trade.exit_price,
+                quantity=trade.quantity,
+                instrument_class=trade.instrument_class or None,
+            )
+            trade.costs = tc.as_dict()
+            trade.net_money_pnl = round(trade.money_pnl - tc.total, 2)
+            self.metrics.total_costs = round(self.metrics.total_costs + tc.total, 2)
+        else:
+            trade.costs = None
+            trade.net_money_pnl = trade.money_pnl
+
         self.metrics.trades.append(trade)
         self.metrics.gross_pnl = round(self.metrics.gross_pnl + trade.money_pnl, 2)
+        self.metrics.net_pnl = round(self.metrics.gross_pnl - self.metrics.total_costs, 2)
         if trade.points_pnl > 0:
             self.metrics.wins += 1
         else:
             self.metrics.losses += 1
-        # Cumulative net PnL (gross until Phase 6 cost model lands).
-        self.metrics.net_pnl = self.metrics.gross_pnl
-        running = self.metrics.net_pnl
-        if running < self._running_low_pnl:
-            self._running_low_pnl = running
-        peak = max(self.metrics.net_pnl, 0.0)
-        drawdown = peak - self._running_low_pnl if self._running_low_pnl < 0 else 0.0
-        if drawdown > self.metrics.max_drawdown:
-            self.metrics.max_drawdown = round(drawdown, 2)
+
+        # Shared drawdown/equity-curve bookkeeping with BacktestEngine.
+        ts = exit_ts_iso or now_ist().isoformat()
+        self._drawdown.record(trade.net_money_pnl, ts)
+        self.metrics.max_drawdown_money = self._drawdown.max_drawdown_money
+        self.metrics.max_drawdown_pct = self._drawdown.max_drawdown_pct
+        self.metrics.equity_curve = list(self._drawdown.equity_curve)
 
     def set_anchor(self, symbol: str, anchor_price: float) -> None:
         self.metrics.anchors[symbol] = anchor_price
@@ -127,7 +176,11 @@ class DailyAudit:
             "losses": self.metrics.losses,
             "gross_pnl": self.metrics.gross_pnl,
             "net_pnl": self.metrics.net_pnl,
-            "max_drawdown": self.metrics.max_drawdown,
+            "total_costs": self.metrics.total_costs,
+            "max_drawdown_money": self.metrics.max_drawdown_money,
+            "max_drawdown_pct": self.metrics.max_drawdown_pct,
+            "equity_curve": self.metrics.equity_curve,
+            "cost_model_attached": self.cost_model is not None,
             "trades": [t.__dict__ for t in self.metrics.trades],
         }
         _atomic_write_json(self.summary_path, summary)

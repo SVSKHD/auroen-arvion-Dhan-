@@ -34,6 +34,7 @@ from engine.anchor_engine import AnchorEngine
 from engine.audit import DailyAudit, TradeSnapshot
 from engine.strategy_runner import StrategyConfig, StrategyPosition, StrategyRunner
 from risk.guardrails import GuardRails
+from risk.position_sizer import PositionSizer
 from strategy.levels import OrderLevels
 
 logger = get_logger("orchestrator")
@@ -60,6 +61,7 @@ class _OcoPair:
     short_intent: str
     levels: OrderLevels
     placed_at: str
+    quantity: int = 1
     filled_side: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -71,6 +73,7 @@ class _OcoPair:
             "short_intent": self.short_intent,
             "levels": self.levels.__dict__,
             "placed_at": self.placed_at,
+            "quantity": self.quantity,
             "filled_side": self.filled_side,
         }
 
@@ -81,6 +84,11 @@ class _SymbolMeta:
     security_id: str
     exchange_segment: str
     lot_size: int = 1
+    money_per_point: float = 1.0
+    # sl_dist mirrors the per-symbol StrategyConfig field, but we cache it
+    # here so the PositionSizer can size without reaching back into the
+    # config dict for every tick.
+    sl_dist: float = 0.0
 
 
 class Orchestrator:
@@ -97,6 +105,7 @@ class Orchestrator:
         no_new_trade_after: time = time(14, 30),
         pre_squareoff_buffer_minutes: int = 5,
         telegram=None,
+        position_sizer: Optional[PositionSizer] = None,
     ) -> None:
         self.mode = mode
         self.broker = broker
@@ -110,6 +119,7 @@ class Orchestrator:
         self.no_new_trade_after = no_new_trade_after
         self.pre_squareoff_buffer = timedelta(minutes=pre_squareoff_buffer_minutes)
         self.telegram = telegram
+        self.position_sizer = position_sizer
 
         self.rolling_bars: dict[str, _RollingBar] = {}
         self.oco_pairs: dict[str, _OcoPair] = {}
@@ -236,13 +246,17 @@ class Orchestrator:
         })
 
         meta = self.symbols[symbol]
+        quantity = self._size_for(symbol, meta)
+        if quantity == 0:
+            return
+
         long_intent = f"{symbol}-{now.date().isoformat()}-LONG-STOP"
         short_intent = f"{symbol}-{now.date().isoformat()}-SHORT-STOP"
         long_order = self.broker.place_stop_order(StopOrderRequest(
             symbol=symbol,
             security_id=meta.security_id,
             side="LONG",
-            quantity=meta.lot_size,
+            quantity=quantity,
             trigger_price=levels.long_entry,
             exchange_segment=meta.exchange_segment,
         ))
@@ -250,7 +264,7 @@ class Orchestrator:
             symbol=symbol,
             security_id=meta.security_id,
             side="SHORT",
-            quantity=meta.lot_size,
+            quantity=quantity,
             trigger_price=levels.short_entry,
             exchange_segment=meta.exchange_segment,
         ))
@@ -266,6 +280,7 @@ class Orchestrator:
             short_intent=short_intent,
             levels=levels,
             placed_at=now.isoformat(),
+            quantity=quantity,
         )
         self.oco_pairs[symbol] = pair
         self._persist_oco_pairs()
@@ -275,6 +290,53 @@ class Orchestrator:
             "long_entry": levels.long_entry,
             "short_entry": levels.short_entry,
         })
+
+    def _size_for(self, symbol: str, meta: _SymbolMeta) -> int:
+        """Compute order quantity for an OCO leg.
+
+        With no PositionSizer attached, fall back to one lot (the Phase 5
+        default) so this method is a pure no-op for callers that don't
+        opt into capital-based sizing.
+
+        With a sizer attached, refuse the trade and emit a
+        `guardrail_blocked` audit event when the sizer returns 0 — the
+        sl_dist exceeds the per-trade risk budget for even a single lot
+        and the caller should NOT under-trade against the configured
+        risk floor.
+        """
+        if self.position_sizer is None:
+            return meta.lot_size
+        sl_dist = meta.sl_dist or self.config.sl_dist
+        decision = self.position_sizer.size(
+            sl_dist=sl_dist,
+            money_per_point=meta.money_per_point,
+            lot_size=meta.lot_size,
+        )
+        if decision.skipped:
+            logger.warning(
+                "Position size 0 for %s: capital=%.2f risk_budget=%.2f "
+                "per_lot_risk=%.2f sl_dist=%.2f money_per_point=%.2f "
+                "lot_size=%d reason=%s",
+                symbol,
+                self.position_sizer.capital,
+                decision.risk_budget,
+                decision.per_lot_risk,
+                sl_dist,
+                meta.money_per_point,
+                meta.lot_size,
+                decision.skipped_reason,
+            )
+            self.audit.emit("guardrail_blocked", symbol, {
+                "reason": "position_size_zero",
+                "sizer_reason": decision.skipped_reason,
+                "capital": self.position_sizer.capital,
+                "max_risk_pct": self.position_sizer.max_risk_pct,
+                "sl_dist": sl_dist,
+                "money_per_point": meta.money_per_point,
+                "lot_size": meta.lot_size,
+            })
+            return 0
+        return decision.quantity
 
     # ------------------------------------------------- paper fill handling
 
@@ -312,7 +374,7 @@ class Orchestrator:
             side=side,
             entry_price=fill_price,
             entry_time=now,
-            quantity=meta.lot_size,
+            quantity=pair.quantity,
             tp=tp,
             sl=sl,
         )
@@ -451,6 +513,7 @@ class Orchestrator:
                 short_intent=p.get("short_intent", ""),
                 levels=OrderLevels(**levels_raw),
                 placed_at=p.get("placed_at", ""),
+                quantity=int(p.get("quantity", 1)),
                 filled_side=p.get("filled_side"),
             )
 
