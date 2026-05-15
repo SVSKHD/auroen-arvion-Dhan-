@@ -1,225 +1,148 @@
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 
-from strategy.levels import build_order_levels
+from engine.strategy_runner import (
+    StrategyConfig,
+    StrategyPosition,
+    StrategyRunner,
+    StrategyTradeResult,
+)
 
 
 @dataclass
-class TradeResult:
-    side: str
-    entry_price: float
-    exit_price: float
-    pnl: float
-    exit_reason: str
+class BacktestSummary:
+    trades: int
+    wins: int
+    losses: int
+    win_rate: float
+    total_points_pnl: float
+    total_money_pnl: float
+    profitable: bool
+    trade_results: list[dict]
 
 
 class BacktestEngine:
     """Session-based anchor breakout backtest.
 
-    Rules:
-    - 09:15 candle open becomes anchor
-    - only candles AFTER anchor are eligible for entry
-    - first threshold breach decides side
-    - trade then follows TP / SL / square-off logic
-    - one trade per session/day
+    Drives StrategyRunner over OHLC bars grouped by IST trading day. One trade
+    per session (first threshold breach). All entry/TP/SL/trailing/square-off
+    decisions come from StrategyRunner — no logic is duplicated here.
     """
+
+    def __init__(self, config: StrategyConfig) -> None:
+        self.config = config
+        self.runner = StrategyRunner(config)
 
     def run(
         self,
         csv_path: str,
-        trigger_dist: float,
-        tp_dist: float,
-        sl_dist: float,
-        anchor_hour: int = 9,
-        anchor_minute: int = 15,
-        square_off_hour: int = 15,
-        square_off_minute: int = 15,
+        quantity: int = 1,
+        money_per_point: float = 1.0,
     ) -> dict:
         df = pd.read_csv(csv_path)
 
         if "time" not in df.columns:
             raise ValueError("CSV must contain 'time' column")
 
+        required_cols = {"time", "open", "high", "low", "close"}
+        missing = required_cols - set(df.columns)
+        if missing:
+            raise ValueError(f"CSV missing columns: {sorted(missing)}")
+
         df["time"] = pd.to_datetime(df["time"])
         df["date"] = df["time"].dt.date
 
-        all_trades: list[TradeResult] = []
+        trades: list[StrategyTradeResult] = []
 
-        grouped = df.groupby("date")
-
-        for _, session_df in grouped:
+        for _, session_df in df.groupby("date"):
             session_df = session_df.sort_values("time").reset_index(drop=True)
+            trade = self._run_session(session_df, quantity, money_per_point)
+            if trade is not None:
+                trades.append(trade)
 
-            anchor_row = session_df[
-                (session_df["time"].dt.hour == anchor_hour)
-                & (session_df["time"].dt.minute == anchor_minute)
-            ]
+        return self._summarize(trades, money_per_point)
 
-            if anchor_row.empty:
+    def _run_session(
+        self,
+        session_df: pd.DataFrame,
+        quantity: int,
+        money_per_point: float,
+    ) -> Optional[StrategyTradeResult]:
+        anchor_time = self.config.anchor_time
+        anchor_mask = (
+            (session_df["time"].dt.hour == anchor_time.hour)
+            & (session_df["time"].dt.minute == anchor_time.minute)
+        )
+        anchor_rows = session_df[anchor_mask]
+        if anchor_rows.empty:
+            return None
+
+        anchor_idx = anchor_rows.index[0]
+        anchor_price = float(anchor_rows.iloc[0]["open"])
+        levels = self.runner.build_levels(anchor_price)
+
+        position: Optional[StrategyPosition] = None
+
+        for i in range(anchor_idx + 1, len(session_df)):
+            row = session_df.iloc[i]
+            bar_time: datetime = row["time"].to_pydatetime()
+            high = float(row["high"])
+            low = float(row["low"])
+            close = float(row["close"])
+
+            if position is None:
+                position = self.runner.detect_entry(
+                    symbol=str(row.get("symbol", "SYMBOL")),
+                    levels=levels,
+                    bar_time=bar_time,
+                    high=high,
+                    low=low,
+                    quantity=quantity,
+                )
                 continue
 
-            anchor_idx = anchor_row.index[0]
-            anchor_price = float(anchor_row.iloc[0]["open"])
-
-            levels = build_order_levels(
-                anchor_price=anchor_price,
-                trigger_dist=trigger_dist,
-                tp_dist=tp_dist,
-                sl_dist=sl_dist,
+            result = self.runner.evaluate_exit(
+                position=position,
+                bar_time=bar_time,
+                high=high,
+                low=low,
+                close=close,
             )
+            if result is not None:
+                return self._apply_money(result, money_per_point)
 
-            trade: TradeResult | None = None
+        return None
 
-            in_position = False
-            side = None
-            entry_price = None
-            tp_price = None
-            sl_price = None
+    @staticmethod
+    def _apply_money(
+        result: StrategyTradeResult,
+        money_per_point: float,
+    ) -> StrategyTradeResult:
+        result.money_pnl = round(result.points_pnl * result.quantity * money_per_point, 2)
+        return result
 
-            for i in range(anchor_idx + 1, len(session_df)):
-                row = session_df.iloc[i]
-
-                high = float(row["high"])
-                low = float(row["low"])
-                close = float(row["close"])
-
-                current_time = row["time"].time()
-
-                if not in_position:
-                    if high >= levels.long_entry:
-                        in_position = True
-                        side = "LONG"
-                        entry_price = levels.long_entry
-                        tp_price = levels.long_tp
-                        sl_price = levels.long_sl
-
-                    elif low <= levels.short_entry:
-                        in_position = True
-                        side = "SHORT"
-                        entry_price = levels.short_entry
-                        tp_price = levels.short_tp
-                        sl_price = levels.short_sl
-
-                    continue
-
-                if side == "LONG":
-                    sl_hit = low <= sl_price
-                    tp_hit = high >= tp_price
-
-                    if sl_hit and tp_hit:
-                        exit_price = sl_price
-                        pnl = exit_price - entry_price
-
-                        trade = TradeResult(
-                            side=side,
-                            entry_price=entry_price,
-                            exit_price=exit_price,
-                            pnl=pnl,
-                            exit_reason="SL_FIRST",
-                        )
-                        break
-
-                    if sl_hit:
-                        exit_price = sl_price
-                        pnl = exit_price - entry_price
-
-                        trade = TradeResult(
-                            side=side,
-                            entry_price=entry_price,
-                            exit_price=exit_price,
-                            pnl=pnl,
-                            exit_reason="SL",
-                        )
-                        break
-
-                    if tp_hit:
-                        exit_price = tp_price
-                        pnl = exit_price - entry_price
-
-                        trade = TradeResult(
-                            side=side,
-                            entry_price=entry_price,
-                            exit_price=exit_price,
-                            pnl=pnl,
-                            exit_reason="TP",
-                        )
-                        break
-
-                elif side == "SHORT":
-                    sl_hit = high >= sl_price
-                    tp_hit = low <= tp_price
-
-                    if sl_hit and tp_hit:
-                        exit_price = sl_price
-                        pnl = entry_price - exit_price
-
-                        trade = TradeResult(
-                            side=side,
-                            entry_price=entry_price,
-                            exit_price=exit_price,
-                            pnl=pnl,
-                            exit_reason="SL_FIRST",
-                        )
-                        break
-
-                    if sl_hit:
-                        exit_price = sl_price
-                        pnl = entry_price - exit_price
-
-                        trade = TradeResult(
-                            side=side,
-                            entry_price=entry_price,
-                            exit_price=exit_price,
-                            pnl=pnl,
-                            exit_reason="SL",
-                        )
-                        break
-
-                    if tp_hit:
-                        exit_price = tp_price
-                        pnl = entry_price - exit_price
-
-                        trade = TradeResult(
-                            side=side,
-                            entry_price=entry_price,
-                            exit_price=exit_price,
-                            pnl=pnl,
-                            exit_reason="TP",
-                        )
-                        break
-
-                if current_time >= time(square_off_hour, square_off_minute):
-                    if side == "LONG":
-                        pnl = close - entry_price
-                    else:
-                        pnl = entry_price - close
-
-                    trade = TradeResult(
-                        side=side,
-                        entry_price=entry_price,
-                        exit_price=close,
-                        pnl=pnl,
-                        exit_reason="SQUARE_OFF",
-                    )
-                    break
-
-            if trade:
-                all_trades.append(trade)
-
-        total_pnl = round(sum(t.pnl for t in all_trades), 2)
-        wins = len([t for t in all_trades if t.pnl > 0])
-        losses = len([t for t in all_trades if t.pnl <= 0])
+    @staticmethod
+    def _summarize(
+        trades: list[StrategyTradeResult],
+        money_per_point: float,
+    ) -> dict:
+        wins = sum(1 for t in trades if t.points_pnl > 0)
+        losses = sum(1 for t in trades if t.points_pnl <= 0)
+        total_points = round(sum(t.points_pnl for t in trades), 2)
+        total_money = round(sum(t.money_pnl for t in trades), 2)
+        win_rate = round((wins / len(trades)) * 100, 2) if trades else 0.0
 
         return {
-            "trades": len(all_trades),
+            "trades": len(trades),
             "wins": wins,
             "losses": losses,
-            "win_rate": round((wins / len(all_trades)) * 100, 2)
-            if all_trades
-            else 0.0,
-            "total_pnl": total_pnl,
-            "profitable": total_pnl > 0,
-            "trade_results": [t.__dict__ for t in all_trades],
+            "win_rate": win_rate,
+            "total_points_pnl": total_points,
+            "total_money_pnl": total_money,
+            "money_per_point": money_per_point,
+            "profitable": total_money > 0,
+            "trade_results": [StrategyRunner.serialize_trade(t) for t in trades],
         }
